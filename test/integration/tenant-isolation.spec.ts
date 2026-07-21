@@ -5,11 +5,10 @@ import { AppModule } from '../../src/app.module';
 import { PrismaService } from '../../src/prisma/prisma.service';
 
 /**
- * Runs against a real Postgres + Redis (see docker-compose.yml / CI service
- * containers) rather than mocks — tenant isolation is exactly the kind of
- * guarantee that's easy to get right against an in-memory fake and wrong
- * against the real row-level query, so this exercises the actual Prisma
- * queries and guards end to end.
+ * Runs against a real Postgres + Redis (see docker-compose.yml) rather than
+ * mocks — tenant isolation is exactly the kind of guarantee that's easy to
+ * get right against an in-memory fake and wrong against the real row-level
+ * query, so this exercises the actual Prisma queries and guards end to end.
  */
 describe('Tenant isolation & environment scoping (integration)', () => {
   let app: INestApplication;
@@ -156,7 +155,10 @@ describe('Tenant isolation & environment scoping (integration)', () => {
     // expecting the database itself to reject it.
     const firstAuditId = history.body[0].id as string;
     await expect(
-      prisma.$executeRawUnsafe(`UPDATE audit_logs SET changed_by = 'tampered' WHERE id = '${firstAuditId}'`),
-    ).rejects.toThrow();
+      prisma.$executeRaw`UPDATE audit_logs SET "changedBy" = 'tampered' WHERE id = ${firstAuditId}`,
+    ).rejects.toThrow(/append-only/);
+    await expect(prisma.$executeRaw`DELETE FROM audit_logs WHERE id = ${firstAuditId}`).rejects.toThrow(
+      /append-only/,
+    );
   });
 });
