@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Multi-Tenant Configuration & Feature Flag Service",
   "private": true,
-  "license": "UNLICENSED",
+  "license": "MIT",
   "scripts": {
     "build": "nest build",
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",

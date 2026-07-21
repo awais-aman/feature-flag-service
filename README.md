@@ -1,171 +1,318 @@
 # Multi-Tenant Configuration & Feature Flag Service
 
 A feature-flag and runtime-configuration service for multiple applications
-("tenants") — percentage-based rollouts, environment-scoped configs,
-immutable audit trails, and real-time distribution — built on NestJS/Postgres/Redis
-and deployed to GCP with Terraform, a blue-green CI/CD pipeline, and
-Prometheus-backed observability.
+("tenants"). Each tenant gets its own API key, three environments
+(development, staging, production), typed flags with percentage rollouts and
+weighted variants, an append-only audit trail, and a server-sent-events
+stream that tells connected clients when a flag changed.
 
-**Deployed URL:** https://flags-staging-verqjaqjyq-uc.a.run.app (staging
-environment — see [Assumptions & Trade-offs](#assumptions--trade-offs) for
-why staging rather than production was deployed live for this submission)
+It is a NestJS API on PostgreSQL (Prisma) and Redis, packaged as a
+multi-stage Docker image, with Terraform for a Cloud Run deployment on GCP.
 
-```bash
-curl https://flags-staging-verqjaqjyq-uc.a.run.app/health
-# {"status":"ok","db":true,"redis":true}
-```
+What makes it more than CRUD over a flags table:
 
----
+- **Deterministic, sticky rollouts.** `sha256(flagKey:userId) % 100` puts a
+  user in the same bucket on every call, and raising a rollout from 30% to
+  50% only *adds* users.
+- **Tenant isolation as an access-control boundary**, enforced by guards on
+  both URL-scoped and body-scoped routes, and tested against a real database.
+- **An audit log the database itself refuses to modify.** A trigger rejects
+  any `UPDATE` or `DELETE` on `audit_logs`, whichever role is connected.
+- **A config cache that is invalidated precisely**, by an event emitted only
+  after the mutating transaction commits.
 
-## Table of Contents
+## Contents
 
-- [Quick Start (local dev)](#quick-start-local-dev)
+- [Quick start](#quick-start)
+- [Walkthrough with real responses](#walkthrough-with-real-responses)
 - [Architecture](#architecture)
-- [Tech Stack & Why](#tech-stack--why)
-- [Data Model](#data-model)
-- [Flag Evaluation Algorithm](#flag-evaluation-algorithm)
-- [API Reference](#api-reference)
-- [Caching Strategy](#caching-strategy)
+- [Data model](#data-model)
+- [Flag evaluation](#flag-evaluation)
+- [API reference](#api-reference)
+- [Caching](#caching)
 - [Security](#security)
-- [Infrastructure (Terraform)](#infrastructure-terraform)
-- [Deployment Strategy](#deployment-strategy)
-- [CI/CD](#cicd)
 - [Observability](#observability)
-- [Testing Strategy & Load Test Results](#testing-strategy--load-test-results)
-- [Assumptions & Trade-offs](#assumptions--trade-offs)
-- [Future Improvements](#future-improvements)
+- [Testing](#testing)
+- [Infrastructure (Terraform)](#infrastructure-terraform)
+- [Releasing to Cloud Run](#releasing-to-cloud-run)
+- [Trade-offs and limits](#trade-offs-and-limits)
+- [Future improvements](#future-improvements)
 
----
+## Quick start
 
-## Quick Start (local dev)
+Requirements: Docker with Compose v2. Node 22 (`.nvmrc`) is only needed if
+you want to run the API outside Docker.
 
 ```bash
-git clone <this-repo>
-cd contrarian-thinking-assessment
+git clone <this-repo> feature-flag-service
+cd feature-flag-service
 cp .env.example .env
-docker compose up -d
-```
-
-This brings up Postgres, Redis, and the API (in watch mode, migrations run
-automatically on container start). Verify:
-
-```bash
+docker compose up -d --build --wait
 curl http://localhost:3000/health
 # {"status":"ok","db":true,"redis":true}
 ```
 
-Host ports are intentionally non-default (`5442` for Postgres, `6399` for
-Redis) to avoid clashing with other local services — see `docker-compose.yml`
-if you need to change them back.
+This starts Postgres 16, Redis 7 and the API in watch mode. Migrations run
+automatically when the API container starts. Host ports are deliberately
+non-default for the datastores (`5442` for Postgres, `6399` for Redis) so
+they don't clash with local instances; change them in `docker-compose.yml`
+if needed.
 
-Without Docker (needs a local Postgres + Redis):
-
-```bash
-npm install
-npx prisma migrate deploy
-npm run start:dev
-```
-
-Run the tests:
+Build, lint and test inside the running API container:
 
 ```bash
-npm run test:unit          # evaluation engine, hashing, API key utils — no DB needed
-npm run test:integration   # tenant isolation, audit trail — needs Postgres+Redis running
-npm run build              # TypeScript compile check
-npx eslint "{src,test}/**/*.ts"
+docker compose exec api npm run build
+docker compose exec api npm run lint
+docker compose exec api npm run test:unit          # no database needed
+docker compose exec api npm run test:integration   # uses the compose Postgres + Redis
 ```
 
----
+Stop everything and delete the data volume:
+
+```bash
+docker compose down -v
+```
+
+Without Docker you need a local Postgres and Redis matching `.env`, then
+`npm ci && npx prisma migrate deploy && npm run start:dev`.
+
+## Walkthrough with real responses
+
+Everything below was captured from the Compose stack above. The API key is
+shortened to its first 6 and last 4 characters, and long responses are trimmed
+where marked.
+
+**1. Register a tenant.** This is the only unauthenticated endpoint. The raw
+key is returned once; only its HMAC digest is stored.
+
+```bash
+curl -X POST http://localhost:3000/api/v1/tenants \
+  -H 'Content-Type: application/json' -d '{"name":"Acme Storefront"}'
+```
+
+```json
+{
+  "id": "be05bb20-91ae-45ca-8f02-8130c240c750",
+  "name": "Acme Storefront",
+  "slug": "acme-storefront-194ssf",
+  "environments": ["development", "staging", "production"],
+  "apiKey": "ffk_Ln...qfuM",
+  "createdAt": "2026-11-08T05:20:05.017Z"
+}
+```
+
+**2. Create a flag.** It starts disabled at 0% in every environment.
+
+```bash
+export TID=be05bb20-91ae-45ca-8f02-8130c240c750 KEY=ffk_...
+curl -X POST http://localhost:3000/api/v1/tenants/$TID/flags \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"key":"new-checkout","name":"New checkout","type":"BOOLEAN","defaultValue":false}'
+```
+
+```json
+{
+  "id": "8ad1b778-b59b-4ce7-b663-94cc5cd10a26",
+  "key": "new-checkout",
+  "type": "BOOLEAN",
+  "defaultValue": false,
+  "archivedAt": null,
+  "environmentConfigs": [
+    { "environmentId": "8667b0ce-...", "enabled": false, "rolloutPercentage": 0, "variants": null, "targetingRules": null },
+    { "environmentId": "02dbe36c-...", "enabled": false, "rolloutPercentage": 0, "variants": null, "targetingRules": null },
+    { "environmentId": "9ae11fee-...", "enabled": false, "rolloutPercentage": 0, "variants": null, "targetingRules": null }
+  ]
+}
+```
+(trimmed: ids, timestamps, `tenantId`)
+
+**3. Subscribe to changes** in production before changing anything:
+
+```bash
+curl -N http://localhost:3000/api/v1/tenants/$TID/environments/production/stream -H "X-API-Key: $KEY"
+```
+
+**4. Roll it out to 30% of production**, and give a STRING flag two weighted
+variants:
+
+```bash
+curl -X PUT "http://localhost:3000/api/v1/tenants/$TID/flags/new-checkout?environment=production" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"rolloutPercentage":30}'
+
+curl -X PUT "http://localhost:3000/api/v1/tenants/$TID/flags/checkout-copy?environment=production" \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d '{"enabled":true,"rolloutPercentage":100,"variants":[{"value":"Pay now","weight":1},{"value":"Complete order","weight":1}]}'
+```
+
+The open stream receives one event per change:
+
+```text
+id: 1
+data: {"flagKey":"new-checkout","environment":"production"}
+
+id: 2
+data: {"flagKey":"checkout-copy","environment":"production"}
+```
+
+`environment` is `null` when the change was to a flag-wide field (name,
+description, `defaultValue`); those reach subscribers of every environment.
+
+**5. Evaluate for a user.** Six users against the 30% rollout:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/evaluate \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d "{\"tenant_id\":\"$TID\",\"environment\":\"production\",\"user_id\":\"user-4\",\"flag_key\":\"new-checkout\"}"
+```
+
+```text
+user-1 {"flagKey":"new-checkout","type":"BOOLEAN","value":false,"reason":"default"}
+user-2 {"flagKey":"new-checkout","type":"BOOLEAN","value":false,"reason":"default"}
+user-3 {"flagKey":"new-checkout","type":"BOOLEAN","value":false,"reason":"default"}
+user-4 {"flagKey":"new-checkout","type":"BOOLEAN","value":true,"reason":"percentage_rollout"}
+user-5 {"flagKey":"new-checkout","type":"BOOLEAN","value":false,"reason":"default"}
+user-6 {"flagKey":"new-checkout","type":"BOOLEAN","value":true,"reason":"percentage_rollout"}
+```
+
+Repeating a call returns the same answer: the bucket depends only on the flag
+key and user id.
+
+**6. Evaluate everything at once** (what an SDK does on start-up):
+
+```bash
+curl -X POST http://localhost:3000/api/v1/evaluate/bulk \
+  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
+  -d "{\"tenant_id\":\"$TID\",\"environment\":\"production\",\"user_id\":\"user-1\"}"
+```
+
+```json
+{
+  "environment": "production",
+  "flags": {
+    "new-checkout": { "type": "BOOLEAN", "value": false, "reason": "default" },
+    "checkout-copy": { "type": "STRING", "value": "Pay now", "reason": "percentage_rollout" }
+  }
+}
+```
+
+**7. Read the audit trail**, newest first. `changedBy` is the 8-character
+display prefix of the key that made the change.
+
+```bash
+curl http://localhost:3000/api/v1/tenants/$TID/flags/new-checkout/history -H "X-API-Key: $KEY"
+```
+
+```json
+[
+  {
+    "action": "ENV_CONFIG_UPDATE",
+    "changedBy": "ffk_Lnto",
+    "previousValue": { "enabled": false, "variants": null, "targetingRules": null, "rolloutPercentage": 0 },
+    "newValue": { "enabled": true, "rolloutPercentage": 30 },
+    "createdAt": "2026-11-08T05:20:05.679Z",
+    "environment": { "name": "production" }
+  },
+  {
+    "action": "FLAG_CREATE",
+    "changedBy": "ffk_Lnto",
+    "previousValue": null,
+    "newValue": { "key": "new-checkout", "name": "New checkout", "type": "BOOLEAN", "defaultValue": false },
+    "createdAt": "2026-11-08T05:20:05.107Z",
+    "environment": null
+  }
+]
+```
+(trimmed: `id`, `tenantId`, `flagId`, `environmentId`)
+
+**8. What the guards and validation return:**
+
+```text
+# tenant A's key, tenant B's tenant_id in the body
+HTTP/1.1 403 Forbidden
+{"message":"tenant_id does not match the authenticated tenant","error":"Forbidden","statusCode":403}
+
+# PUT ...?environment=prod
+{"message":"Validation failed (enum string is expected)","error":"Bad Request","statusCode":400}
+
+# evaluating a flag after DELETE (archive)
+{"message":"Flag \"checkout-copy\" not found for this tenant/environment","error":"Not Found","statusCode":404}
+```
 
 ## Architecture
 
 ```mermaid
-flowchart TB
-    subgraph Clients
-        SDK[Client apps / SDKs]
+flowchart LR
+    SDK[Client apps / SDKs] -->|"X-API-Key"| API
+
+    subgraph API[NestJS API]
+        direction TB
+        Guards["ApiKeyGuard → TenantMatchGuard → TenantThrottlerGuard"]
+        Flags[FlagsService]
+        Eval[EvaluationService]
+        Cache[FlagConfigCacheService]
+        SSE[RealtimeController]
+        Bus(("flag.changed<br/>EventEmitter2"))
+        Guards --> Flags & Eval
+        Eval --> Cache
+        Flags -- "after commit" --> Bus
+        Bus --> Cache
+        Bus --> SSE
     end
 
-    subgraph "Cloud Run (flags-ENV)"
-        API[NestJS API]
-    end
-
-    SDK -->|"X-API-Key + HTTPS"| API
-    API -->|"private IP via VPC connector"| SQL[(Cloud SQL Postgres)]
-    API -->|"private IP via VPC connector"| Redis[(Memorystore Redis)]
-    API -->|"secretAccessor"| SM[Secret Manager]
-    API -->|structured JSON logs| Logging[Cloud Logging]
-    API -->|"/metrics scrape"| Prom[Managed Service for Prometheus]
-    Prom --> Monitoring[Cloud Monitoring: Dashboard + Alerts]
-
-    GH[GitHub Actions] -->|"WIF, no JSON keys"| AR[Artifact Registry]
-    GH -->|"gcloud run deploy --no-traffic + update-traffic"| API
+    Flags -->|"flag + audit row in one transaction"| PG[(PostgreSQL)]
+    Cache -->|"flagconfig:v1:* (30s TTL)"| Redis[(Redis)]
+    Cache -->|miss| PG
+    SSE -->|text/event-stream| SDK
+    API -->|"/metrics"| Prom[Prometheus scraper]
 ```
 
-Request flow for the hot path (`POST /api/v1/evaluate`):
+The hot path, `POST /api/v1/evaluate`:
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant G as ApiKeyGuard
     participant E as EvaluationService
-    participant Cache as Redis (config cache)
+    participant R as Redis
     participant DB as Postgres
 
     C->>G: POST /evaluate + X-API-Key
-    G->>DB: lookup tenant by HMAC(key)
+    G->>DB: tenant by HMAC(key)
     G-->>E: request.tenant attached
-    E->>Cache: GET flagconfig:v1:{tenant}:{env}:{flag}
-    alt cache hit
-        Cache-->>E: resolved config
-    else cache miss
-        E->>DB: fetch flag + env config (join)
-        DB-->>E: config
-        E->>Cache: SET (30s TTL)
+    E->>R: GET flagconfig:v1:{tenant}:{env}:{flag}
+    alt hit
+        R-->>E: resolved config
+    else miss
+        E->>DB: flag + environment config
+        E->>R: SET (30s TTL)
     end
-    E->>E: sha256(flagKey:userId) % 100 → bucket
+    E->>E: sha256(flagKey:userId) % 100
     E-->>C: { value, reason }
 ```
 
----
-
-## Tech Stack & Why
+The GCP target that `terraform/` provisions: Cloud Run reaching Cloud SQL and
+Memorystore over private IP through a VPC connector, secrets from Secret
+Manager, logs to Cloud Logging, and dashboards and alerts in Cloud Monitoring.
 
 | Layer | Choice | Why |
 |---|---|---|
-| Backend | NestJS + TypeScript | Guards/interceptors map cleanly onto per-tenant auth + isolation; matches the job's stated preference |
-| Database | PostgreSQL (Cloud SQL) | ACID for the audit trail (see immutability trigger below); relational joins are the natural fit for flag ⨯ environment config |
-| Cache | Redis (Memorystore) | Sub-ms config lookups; see [Caching Strategy](#caching-strategy) for what's cached and why |
-| ORM | Prisma | Type-safe queries, first-class migrations, transactions for atomic flag+audit writes |
-| Compute | Cloud Run | Serverless, scales to zero in dev/staging, native revision-based traffic splitting is exactly what blue-green/canary needs — no separate load balancer to build |
-| IaC | Terraform | Modular (see `terraform/modules/`), remote GCS state with locking, environment separation via `.tfvars` |
-| CI/CD | GitHub Actions | Free, native OIDC support for Workload Identity Federation (no JSON keys) |
-| Metrics | prom-client + Managed Service for Prometheus | See [Observability](#observability) — app stays cloud-agnostic, no GCP SDK coupling in business logic |
-| Logging | nestjs-pino | Structured JSON out of the box, correlation IDs threaded through |
+| API | NestJS 11 + TypeScript | Guards and interceptors map directly onto per-tenant auth, isolation and instrumentation |
+| Database | PostgreSQL 16 | ACID for flag + audit writes; the flag × environment shape is relational |
+| ORM | Prisma 6 | Typed queries, migrations, interactive transactions |
+| Cache | Redis 7 (ioredis) | Sub-millisecond config lookups on the evaluation path |
+| Logging | nestjs-pino | Structured JSON with a correlation id per request |
+| Metrics | prom-client | `/metrics` stays cloud-agnostic; any Prometheus scraper can read it |
+| Compute | Cloud Run | One stateless HTTP service; revision traffic splitting covers blue-green and canary without a separate load balancer |
+| IaC | Terraform | Modules per concern, GCS remote state per environment |
 
-**Why not GKE:** the job posting explicitly wants judgment on Cloud Run vs.
-GKE vs. VMs, so here's mine — this service is a single stateless HTTP API
-with no need for sidecars, custom scheduling, or multi-container pods per
-replica. Cloud Run gives autoscaling, revision-based traffic splitting, and
-zero cluster-maintenance burden for exactly that shape of workload. GKE
-Autopilot would be the right call if this were one of several services
-sharing a mesh, needing DaemonSets, or requiring finer-grained node-level
-control — none of which apply here. If that changes (e.g. adding a
-long-lived WebSocket fanout service per the real-time bonus, at scale), GKE
-would be worth revisiting.
+**Why not GKE:** this is a single stateless HTTP API with no need for
+sidecars, custom scheduling or multi-container pods. Cloud Run gives
+autoscaling and revision-based traffic splitting with no cluster to run. GKE
+Autopilot would be worth it once there are several services sharing a mesh,
+or a long-lived WebSocket fan-out tier at scale.
 
-**Why not bcrypt for API keys:** bcrypt is designed to be slow (defeating
-brute-force on low-entropy, human-chosen passwords) and its random salt makes
-it impossible to look up a row by hash equality — you'd have to fetch every
-tenant and `bcrypt.compare()` each one on every authenticated request. API
-keys here are 256-bit machine-generated random tokens, already
-high-entropy; what they need is a fast, deterministic digest for O(1)
-lookup, not slow hashing. HMAC-SHA256 with a server-side pepper (see
-`src/common/utils/api-key.util.ts`) gives both: unrecoverable without the
-pepper, and directly indexable.
-
----
-
-## Data Model
+## Data model
 
 ```mermaid
 erDiagram
@@ -218,276 +365,227 @@ erDiagram
     }
 ```
 
-**Key decision — a flag is defined once per tenant, not once per
-environment.** `FeatureFlag` holds identity (`key`, `type`, `defaultValue`);
-`FlagEnvironmentConfig` holds the part that actually varies per environment
-(`enabled`, `rolloutPercentage`, `variants`, `targetingRules`) — one row per
-`(flag, environment)`. This mirrors how LaunchDarkly/Unleash actually model
-flags: the same flag key exists across dev/staging/production, and each
-environment can be toggled or rolled out independently without duplicating
-the flag's identity. The alternative (a fully separate flag row per
-environment) would let a flag's *type* or *default value* drift between
-environments, which is a bug waiting to happen, not a feature.
+**A flag is defined once per tenant, not once per environment.**
+`FeatureFlag` holds identity (`key`, `type`, `defaultValue`);
+`FlagEnvironmentConfig` holds what actually varies (`enabled`,
+`rolloutPercentage`, `variants`, `targetingRules`), one row per
+`(flag, environment)`. This is how LaunchDarkly and Unleash model it. A
+separate flag row per environment would let a flag's type or default drift
+between environments, which is a bug waiting to happen.
 
-Every flag starts **disabled at 0% in every environment**, including
-production, when created — an explicit opt-in step is always required
-before a flag can affect real users anywhere.
+**Audit immutability is enforced by the database**, not only by the absence
+of update/delete code paths. A `BEFORE UPDATE OR DELETE` trigger on
+`audit_logs` (`prisma/migrations/20260721135521_audit_log_immutability`)
+raises unconditionally. `REVOKE` alone is not enough here, because the app
+role also owns the table and Postgres owners keep implicit rights. The
+integration suite issues a raw `UPDATE` and `DELETE` and asserts the trigger's
+error.
 
-**Audit immutability is enforced at the database layer**, not just by
-omitting update/delete code paths in the app. A `BEFORE UPDATE OR DELETE`
-trigger on `audit_logs` (see
-`prisma/migrations/20260721135521_audit_log_immutability/migration.sql`)
-raises an exception unconditionally. A plain `REVOKE UPDATE, DELETE` isn't
-enough here since the app's own DB role is also the table owner in this
-setup, and Postgres table owners retain implicit rights over their own
-objects regardless of `GRANT`/`REVOKE` — the trigger is what actually holds
-regardless of which role is connected. Verified in
-`test/integration/tenant-isolation.spec.ts` by attempting a raw `UPDATE` and
-asserting the database itself rejects it.
+## Flag evaluation
 
----
-
-## Flag Evaluation Algorithm
-
-`src/common/utils/rollout-hash.util.ts`
+`src/common/utils/rollout-hash.util.ts`:
 
 ```ts
-function bucketFor(flagKey: string, userId: string): number {
+export function bucketFor(flagKey: string, userId: string): number {
   const digest = createHash('sha256').update(`${flagKey}:${userId}`).digest();
   return digest.readUInt32BE(0) % 100; // 0-99
 }
 ```
 
-- **Deterministic:** the same `(flagKey, userId)` pair always hashes to the
-  same bucket — a user's rollout status never flips on repeated calls.
-- **Keyed on `flagKey:userId`, not just `userId`:** each flag gets an
-  independent, uncorrelated bucket assignment per user. A user in the first
-  10% of Flag A is not necessarily in the first 10% of Flag B — unrelated
-  rollouts don't all land on the same cohort by coincidence.
-- **Sticky as percentages climb:** `bucket < rolloutPercentage` means a
-  30%→50% rollout only *adds* buckets 30-49 on top of the existing 0-29 —
-  nobody who was already enabled gets disabled as the percentage increases.
-  Verified in `test/unit/rollout-hash.spec.ts` (`at10 ⊆ at30 ⊆ at70`).
+- **Deterministic:** the same `(flagKey, userId)` always lands in the same
+  bucket.
+- **Independent per flag:** keying on `flagKey:userId` instead of `userId`
+  means the first 10% of flag A is not also the first 10% of flag B.
+- **Monotonic:** `bucket < rolloutPercentage`, so raising the percentage only
+  adds buckets. The unit suite checks `at10 ⊆ at30 ⊆ at70` over 5,000 users.
 
-**Behavior by type** (`src/evaluation/evaluation.service.ts`, `resolveValue`):
+Resolution order (`resolveValue` in `src/evaluation/evaluation.service.ts`):
 
-| Type | Behavior |
+1. A `targetingRules.userIds` match returns `targetingRules.value` (or the
+   default) with reason `targeting_override`, even if the flag is disabled.
+2. A disabled environment returns `defaultValue` with `flag_disabled`.
+3. Otherwise, by type:
+
+| Type | Behaviour |
 |---|---|
-| `BOOLEAN` | `rolloutPercentage` gates `true`/`false` via the bucket above |
-| `STRING` | `rolloutPercentage` gates entry into weighted **variant** selection (`selectVariant` maps the same 0-99 bucket onto cumulative weight ranges); outside the rollout, or with no variants configured, falls back to `defaultValue` |
-| `NUMBER` | No rollout concept beyond enabled/disabled — there's only one number to serve. Percentage-based numeric A/B tests are out of scope; encode them as `STRING` variants instead (documented trade-off, not a gap I hid) |
+| `BOOLEAN` | `true` with `percentage_rollout` inside the rollout, `false` with `default` outside it |
+| `STRING` | Inside the rollout, a weighted variant is picked from the same bucket (weights are relative); outside it, or with no variants, `defaultValue` |
+| `NUMBER` | `defaultValue`; `enabled` is the only gate. Numeric A/B tests should be modelled as STRING variants |
 
-**Targeting overrides** take priority over rollout math: a
-`targetingRules.userIds` allow-list on the environment config forces a
-specific value for named users regardless of type or bucket — useful for
-"always on for our own QA account" without touching the rollout percentage.
+Variants are accepted only on STRING flags, and every variant value must be a
+string.
 
-Evaluation reasons returned to the caller (`reason` field):
-`targeting_override` | `flag_disabled` | `percentage_rollout` | `default`.
+## API reference
 
----
+All routes except `/health` and `/metrics` are under `/api/v1`. Every route
+except `POST /tenants` requires `X-API-Key`.
 
-## API Reference
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/tenants` | `{ name }`, returns the API key once |
+| `POST` | `/tenants/:tenantId/flags` | `{ key, name, description?, type, defaultValue }`; 409 on a duplicate key |
+| `GET` | `/tenants/:tenantId/flags` | `?environment=` and `?status=active\|archived` filters |
+| `PUT` | `/tenants/:tenantId/flags/:flagKey` | Flag-wide fields (`name`, `description`, `defaultValue`) need no query; `enabled`, `rolloutPercentage`, `variants`, `targetingRules` need `?environment=` |
+| `DELETE` | `/tenants/:tenantId/flags/:flagKey` | Archives (soft delete); archived flags stop evaluating |
+| `GET` | `/tenants/:tenantId/flags/:flagKey/history` | Audit entries, newest first |
+| `POST` | `/evaluate` | `{ tenant_id, environment, user_id, flag_key }` |
+| `POST` | `/evaluate/bulk` | `{ tenant_id, environment, user_id }`, all active flags |
+| `GET` | `/tenants/:tenantId/environments/:environment/stream` | SSE change notifications |
+| `GET` | `/health` | 200 when Postgres and Redis answer, 503 otherwise |
+| `GET` | `/metrics` | Prometheus text format |
 
-All endpoints are under `/api/v1`. Every endpoint except `POST /tenants`
-requires an `X-API-Key` header.
+`/evaluate` carries `tenant_id` in the body because SDKs post one payload
+shape to both evaluate endpoints. `EvaluateTenantMatchGuard` rejects a body
+`tenant_id` that differs from the key's tenant. Unknown environment names are
+a 400 everywhere.
 
-### Register a tenant
+## Caching
 
-```bash
-curl -X POST http://localhost:3000/api/v1/tenants \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Acme Corp"}'
-```
-```json
-{
-  "id": "a9e1a912-...",
-  "name": "Acme Corp",
-  "slug": "acme-corp-5trt61",
-  "environments": ["development", "staging", "production"],
-  "apiKey": "ffk_<returned-once>",
-  "createdAt": "2026-07-21T14:36:47.400Z"
-}
-```
-`apiKey` is returned **exactly once** — only its HMAC digest is stored.
+Redis caches the **resolved flag + environment config**, not per-user
+results. The config keyspace is bounded (`tenants × flags × environments`);
+a per-user cache would be unbounded, and it would save a hash computation
+that already takes under a microsecond. The cost worth saving is the Postgres
+round trip (`src/evaluation/flag-config-cache.service.ts`).
 
-### Create a flag
+- Key: `flagconfig:v1:{tenantId}:{environment}:{flagKey}`, 30 s TTL as a
+  safety net.
+- Invalidation is explicit: `FlagsService` emits `flag.changed` after the
+  transaction commits (never from inside it, so nothing reacts to a rollback),
+  and the cache deletes the affected keys. A flag-wide change clears all three
+  environments even if it arrived with `?environment=`.
+- `/evaluate/bulk` skips the cache and runs one joined query. That already
+  avoids N+1, and N Redis round trips would be slower for realistic flag
+  counts.
 
-```bash
-curl -X POST http://localhost:3000/api/v1/tenants/{tenantId}/flags \
-  -H "X-API-Key: ffk_..." -H "Content-Type: application/json" \
-  -d '{"key":"new-checkout","name":"New Checkout","type":"BOOLEAN","defaultValue":false}'
-```
-
-### List flags (filter by environment/status)
-
-```bash
-curl "http://localhost:3000/api/v1/tenants/{tenantId}/flags?environment=production&status=active" \
-  -H "X-API-Key: ffk_..."
-```
-
-### Update a flag — environment-scoped fields require `?environment=`
-
-```bash
-curl -X PUT "http://localhost:3000/api/v1/tenants/{tenantId}/flags/new-checkout?environment=production" \
-  -H "X-API-Key: ffk_..." -H "Content-Type: application/json" \
-  -d '{"enabled": true, "rolloutPercentage": 30}'
-```
-`name`/`description`/`defaultValue` apply across all environments and don't
-need `?environment=`; `enabled`/`rolloutPercentage`/`variants`/`targetingRules`
-do, since those are per-environment state.
-
-### Archive (soft-delete) a flag
-
-```bash
-curl -X DELETE http://localhost:3000/api/v1/tenants/{tenantId}/flags/new-checkout \
-  -H "X-API-Key: ffk_..."
-```
-
-### Evaluate one flag
-
-```bash
-curl -X POST http://localhost:3000/api/v1/evaluate \
-  -H "X-API-Key: ffk_..." -H "Content-Type: application/json" \
-  -d '{"tenant_id":"a9e1a912-...","environment":"production","user_id":"user-42","flag_key":"new-checkout"}'
-```
-```json
-{ "flagKey": "new-checkout", "type": "BOOLEAN", "value": true, "reason": "percentage_rollout" }
-```
-
-### Evaluate all active flags
-
-```bash
-curl -X POST http://localhost:3000/api/v1/evaluate/bulk \
-  -H "X-API-Key: ffk_..." -H "Content-Type: application/json" \
-  -d '{"tenant_id":"a9e1a912-...","environment":"production","user_id":"user-42"}'
-```
-```json
-{ "environment": "production", "flags": { "new-checkout": { "type": "BOOLEAN", "value": true, "reason": "percentage_rollout" } } }
-```
-
-### Flag history (audit trail)
-
-```bash
-curl http://localhost:3000/api/v1/tenants/{tenantId}/flags/new-checkout/history \
-  -H "X-API-Key: ffk_..."
-```
-
-### Real-time subscription (bonus)
-
-```bash
-curl -N "http://localhost:3000/api/v1/tenants/{tenantId}/environments/production/stream" \
-  -H "X-API-Key: ffk_..."
-# id: 1
-# data: {"flagKey":"new-checkout","environment":"production"}
-```
-
----
-
-## Caching Strategy
-
-Redis caches the **resolved flag+environment config**, not per-user
-evaluation results. The config keyspace is small and bounded (`tenants ×
-flags × environments`); a per-user-result cache would be unbounded
-(`× users`) for a hash computation that's already sub-microsecond — the cost
-being saved is the Postgres round trip to fetch config, not the bucket math,
-so that's what's cached (`src/evaluation/flag-config-cache.service.ts`).
-
-- Cache key: `flagconfig:v1:{tenantId}:{environment}:{flagKey}`
-- TTL: 30s safety net, but invalidation is explicit and immediate —
-  `FlagsService` emits a `flag.changed` event after every committed mutation
-  (never from inside the transaction, so a listener can't react to a change
-  that later rolled back), and `FlagConfigCacheService.handleFlagChanged`
-  deletes the affected key(s) on that event.
-- The bulk evaluation endpoint **bypasses the cache** and issues one joined
-  Postgres query instead — it already avoids the N+1 problem the cache
-  exists to solve, and N Redis round trips per bulk request would be slower
-  than one Postgres query for realistic per-tenant flag counts.
-
----
+The hit/miss ratio is exported as `flag_config_cache_lookups_total`. In the
+walkthrough above it was 6 hits and 2 misses.
 
 ## Security
 
-- **API keys:** `ffk_<32 bytes base64url>`, stored as HMAC-SHA256 digests
-  (server-side pepper via `API_KEY_PEPPER`, itself in Secret Manager) — never
-  in plaintext, never recoverable. See [Tech Stack](#tech-stack--why) for why
-  not bcrypt.
-- **Tenant isolation is enforced at the guard layer**, not just a query
-  filter: `TenantMatchGuard` (URL-based routes) and `EvaluateTenantMatchGuard`
-  (body-based `/evaluate`) both compare the authenticated tenant against the
-  requested tenant and 403 on mismatch — verified in
-  `test/integration/tenant-isolation.spec.ts` including an explicit
-  "tenant A spoofs tenant B's `tenant_id` in the body" test.
-- **Per-tenant rate limiting** (`TenantThrottlerGuard`) keys on tenant ID, not
-  source IP — one noisy tenant can't exhaust another tenant's budget, and two
-  tenants behind the same NAT/IP aren't capped together. `/evaluate` and the
-  CRUD endpoints have independent limits (`EVALUATE_RATE_LIMIT_PER_MIN` /
-  `FLAGS_RATE_LIMIT_PER_MIN`, both env-configurable) — CRUD is a low-volume
-  admin action, `/evaluate` is the hot SDK path and needs a much higher
-  ceiling. **Caught in testing:** an earlier version registered these two
-  named throttlers via two separate `ThrottlerModule.forRootAsync()` calls in
-  sibling feature modules, and the single resolved guard instance silently
-  enforced the *wrong* one — `/evaluate` was capped at the CRUD limit
-  (confirmed via `X-RateLimit-Limit-*` response headers under load test).
-  Fixed by registering both named throttlers once in `AppModule` and using
-  `@SkipThrottle()` per controller — the documented, collision-free pattern
-  for multiple named throttlers.
-- **Secrets:** `DATABASE_URL`, `REDIS_URL`, `API_KEY_PEPPER` all live in
-  Secret Manager in the deployed environment, injected via Cloud Run's
-  `secret_key_ref` (never a plaintext env var) — see
-  `terraform/modules/secret_manager` and `terraform/modules/cloud_run`.
-  Locally, `.env` (gitignored) fills the same role.
-- **Least-privilege IAM:** the Cloud Run runtime SA gets `cloudsql.client`,
-  `artifactregistry.reader`, `logging.logWriter`, `monitoring.metricWriter`,
-  and per-secret `secretAccessor` bindings (not project-wide) — see
-  `terraform/modules/iam` and `terraform/modules/secret_manager`. The CI
-  deployer identity (Workload Identity Federation, no JSON keys) is separate
-  and narrower still: `run.admin` + `artifactregistry.writer` +
-  `iam.serviceAccountUser`, nothing touching application data.
+- **API keys** are `ffk_` + 32 random bytes (base64url), stored only as
+  HMAC-SHA256 with a server-side pepper (`API_KEY_PEPPER`). I chose HMAC over
+  bcrypt on purpose: bcrypt's random salt makes lookup by hash impossible, so
+  every request would need a scan-and-compare across tenants. Its slowness
+  also defends low-entropy passwords, which these 256-bit tokens are not.
+- **Keys never reach the logs:** pino redacts `X-API-Key` and `Authorization`
+  from the request it attaches to each log line.
+- **Tenant isolation** is enforced by `TenantMatchGuard` (URL routes) and
+  `EvaluateTenantMatchGuard` (body routes). The integration suite includes
+  tenant A reading tenant B's URL and spoofing B's `tenant_id`.
+- **Per-tenant rate limits** (`TenantThrottlerGuard`) key on tenant id, not
+  IP, with separate budgets for CRUD (`FLAGS_RATE_LIMIT_PER_MIN`, default 120)
+  and evaluation (`EVALUATE_RATE_LIMIT_PER_MIN`, default 3000). Both named
+  throttlers are registered once in `AppModule`, with `@SkipThrottle` per
+  controller. An earlier version registered them in two feature modules, and
+  `/evaluate` silently enforced the CRUD limit; load testing exposed it through
+  the `X-RateLimit-Limit-*` headers.
+- **In GCP**, `DATABASE_URL`, `REDIS_URL` and `API_KEY_PEPPER` live in Secret
+  Manager with per-secret accessor bindings, and Cloud SQL and Memorystore have
+  private IPs only. The runtime service account gets `cloudsql.client`,
+  `artifactregistry.reader`, `logging.logWriter` and `monitoring.metricWriter`.
+  Locally `.env` (git-ignored) plays the same role. `.env.example` holds only
+  development placeholders.
 
----
+## Observability
+
+- **Logs:** one JSON line per request from `LoggingInterceptor`: method,
+  route, tenant, status, latency and correlation id. The id is reused from an
+  incoming `X-Correlation-Id` or generated, and echoed on the response. It runs
+  after guards, so `tenantId` is present. Requests rejected by a guard are not
+  logged there. An SSE stream is logged once, when it opens.
+- **Metrics** at `GET /metrics` (`src/metrics/metrics.service.ts`), sampled
+  from the walkthrough:
+
+  ```text
+  # TYPE flag_evaluation_latency_ms histogram
+  flag_evaluation_latency_ms_count{tenant_id="be05bb20-...",endpoint="evaluate"} 7
+  # TYPE flag_evaluations_total counter
+  flag_evaluations_total{tenant_id="be05bb20-..."} 8
+  # TYPE http_requests_total counter
+  http_requests_total{tenant_id="be05bb20-...",endpoint="POST /api/v1/evaluate",status_class="2xx"} 7
+  http_requests_total{tenant_id="be05bb20-...",endpoint="POST /api/v1/evaluate",status_class="4xx"} 1
+  # TYPE flag_config_cache_lookups_total counter
+  flag_config_cache_lookups_total{result="hit"} 6
+  flag_config_cache_lookups_total{result="miss"} 2
+  ```
+
+  I expose Prometheus metrics instead of writing to the Cloud Monitoring API
+  from application code. That keeps the GCP SDK and credentials out of
+  business logic and local tests. In GCP, Managed Service for Prometheus can
+  scrape the endpoint into Cloud Monitoring.
+- **Dashboard and alerts** (`terraform/modules/monitoring`): request count by
+  response class, p50/p95/p99 latency and instance count from Cloud Run's
+  built-in metrics, plus alerts for 5xx rate, p99 > 300 ms and uptime-check
+  failure, sent to a configured email. The 5xx alert uses an absolute rate,
+  not a percentage of traffic (see trade-offs).
+
+## Testing
+
+| Suite | Covers |
+|---|---|
+| `test/unit/rollout-hash.spec.ts` | Determinism, uniform distribution over 20k users, monotonic rollouts, 0%/100% edges, weighted variants |
+| `test/unit/resolve-value.spec.ts` | Resolution order and reasons for every flag type, including targeting overrides on disabled flags |
+| `test/unit/api-key.util.spec.ts` | Key format and uniqueness, HMAC determinism, pepper sensitivity |
+| `test/unit/metrics.service.spec.ts` | Exact Prometheus series names and labels |
+| `test/unit/logging.interceptor.spec.ts` | SSE streams counted once, regular requests logged with tenant |
+| `test/integration/tenant-isolation.spec.ts` | Auth rejection, URL and body tenant spoofing, environment scoping, audit trail and the immutability trigger |
+| `test/integration/flag-lifecycle.spec.ts` | Archived flags stop evaluating, cross-environment cache invalidation, variant validation, unknown environments, concurrent duplicate creates, SSE delivery per environment |
+| `test/load/evaluate-load-test.js` | k6: `/evaluate` under ramping concurrency across 20 tenants |
+
+Unit tests need nothing running. Integration tests boot the full `AppModule`
+against real Postgres and Redis rather than mocks, because tenant isolation is
+easy to get right against a fake and wrong against the real query.
+
+Load test, against the Compose stack or a deployed URL (needs
+[k6](https://k6.io), or its Docker image):
+
+```bash
+k6 run test/load/evaluate-load-test.js
+k6 run -e BASE_URL=https://<service-url> test/load/evaluate-load-test.js
+```
+
+Earlier runs against the production image on a single instance, on a shared
+development laptop:
+
+| Scenario | Throughput | p50 | p95 | p99 | Errors |
+|---|---|---|---|---|---|
+| 50 VUs, 90 s sustained | ~784 req/s | 31 ms | 43 ms | 61 ms | 0% |
+| 100 VUs, 4 min ramp | ~680 req/s | 56 ms | 124 ms | 1.33 s | 0% |
+
+At 100 VUs the p99 tail came from CPU contention on one Node process, not
+from errors. Horizontal scaling (`cloud_run_max_instances = 20` in production)
+is what absorbs that. Rate limits are per tenant, which is why the script
+spreads load over 20 tenants instead of measuring the limiter.
 
 ## Infrastructure (Terraform)
 
 ```
 terraform/
-├── global/            # applied ONCE: Artifact Registry, GitHub WIF + deployer SA
+├── global/              # applied once: Artifact Registry + deployer identity
 ├── modules/
-│   ├── networking/     # VPC, subnet, private services access, VPC connector
-│   ├── cloud_sql/      # Postgres, private IP only, backups
+│   ├── networking/      # VPC, subnet, private services access, VPC connector
+│   ├── cloud_sql/       # Postgres, private IP only, backups
 │   ├── memorystore/     # Redis, private IP only
-│   ├── iam/            # per-environment Cloud Run runtime service account
-│   ├── secret_manager/  # 3 secrets, per-secret IAM bindings
-│   ├── cloud_run/       # the service — see ownership split below
+│   ├── iam/             # per-environment Cloud Run runtime service account
+│   ├── secret_manager/  # 3 secrets with per-secret IAM bindings
+│   ├── cloud_run/       # the service (image and traffic deliberately ignored)
 │   └── monitoring/      # notification channel, alert policies, dashboard
-├── environments/
-│   ├── {dev,staging,production}.tfvars
-│   └── {dev,staging,production}-backend.hcl   # GCS backend config per env
-├── main.tf / variables.tf / outputs.tf
+├── environments/        # {dev,staging,production}.tfvars + *-backend.hcl
+└── main.tf / variables.tf / outputs.tf
 ```
 
-**Why `global/` is separate:** Artifact Registry holds one image promoted
-across all three environments, and the GitHub deployer identity isn't
-scoped to any one environment either. If these lived in the per-environment
-stack, applying dev/staging/prod from three separate state files would each
-try to create the *same* GCP resource and collide. Global resources are
-applied once, from their own state; everything else is applied per
-environment with its own `.tfvars` and GCS backend prefix (remote state,
-locking, no shared state file across environments).
+**`global/` is a separate stack** because Artifact Registry holds one image
+promoted through every environment, and the deployer identity is not
+per-environment. In the per-environment stack, three state files would each
+try to create the same resource. See `terraform/global/README.md`.
 
-**Terraform vs. CI/CD ownership split (Cloud Run):** Terraform provisions
-the *service* (compute shape, secrets, networking, IAM) but explicitly
-`lifecycle.ignore_changes`s the `image` and `traffic` fields. The deploy
-workflows own individual releases and traffic shifts via `gcloud run deploy
---no-traffic` / `gcloud run services update-traffic`. Without this split,
-every `terraform apply` for an unrelated infra change (e.g. bumping the
-Cloud SQL tier) would silently revert whatever revision/split the last
-deploy left in place.
-
-### Apply
+**Terraform owns the service, not the release.** The Cloud Run module sets
+`lifecycle.ignore_changes` on `image` and `traffic`. Otherwise a `terraform
+apply` for an unrelated change, such as a bigger Cloud SQL tier, would roll
+back whatever revision and traffic split the last release left in place.
 
 ```bash
-# one-time, once per project
+# once per project
 cd terraform/global
 terraform init -backend-config=backend.hcl
 terraform apply -var="project_id=<project>" -var="github_repository=<owner/repo>"
@@ -496,243 +594,89 @@ terraform apply -var="project_id=<project>" -var="github_repository=<owner/repo>
 cd terraform
 terraform init -backend-config=environments/dev-backend.hcl
 terraform apply -var-file=environments/dev.tfvars \
-  -var="project_id=<project>" \
-  -var="alert_notification_email=<you@example.com>" \
-  -var="github_repository=<owner/repo>"
+  -var="project_id=<project>" -var="alert_notification_email=<you@example.com>"
 ```
 
-(Replace the `REPLACE_WITH_YOUR_TFSTATE_BUCKET` placeholder in each
-`*-backend.hcl` with a real GCS bucket first — `gsutil mb` one if you don't
-have one yet.)
+Replace `REPLACE_WITH_YOUR_TFSTATE_BUCKET` in each `*-backend.hcl` first. Both
+stacks pass `terraform fmt -check` and `terraform validate` (Terraform 1.9).
 
-### Running migrations against Cloud SQL
-
-Cloud SQL has no public IP (by design — see [Security](#security)), so a
-laptop off the VPC can't reach it directly, including via Cloud SQL Auth
-Proxy's default mode (that still resolves the *public* IP path unless told
-otherwise, and there isn't one here). The straightforward fix is a one-off
-**Cloud Run Job** using the same image and the same Direct VPC Egress
-config as the service:
+**Migrations against Cloud SQL.** It has no public IP, so run them as a
+one-off Cloud Run Job on the same network and service account:
 
 ```bash
 gcloud run jobs create migrate-<env> \
-  --image=<same image as the service> \
-  --region=us-central1 \
+  --image=<same image as the service> --region=us-central1 \
   --network=flags-<env>-vpc --subnet=flags-<env>-subnet --vpc-egress=private-ranges-only \
   --service-account=flags-<env>-run-sa@<project>.iam.gserviceaccount.com \
   --set-secrets="DATABASE_URL=flags-<env>-database-url:latest,REDIS_URL=flags-<env>-redis-url:latest,API_KEY_PEPPER=flags-<env>-api-key-pepper:latest" \
   --command="npx" --args="prisma,migrate,deploy"
-
 gcloud run jobs execute migrate-<env> --region=us-central1 --wait
 ```
 
-No bastion host, no temporary public IP toggle, no VPN — the job runs inside
-the same private network the service already trusts.
+## Releasing to Cloud Run
 
----
+The `runtime` stage of the Dockerfile is the deployable image: production
+dependencies only, a non-root user, and a `HEALTHCHECK` against `/health`.
 
-## Deployment Strategy
-
-**Cloud Run's native revision traffic-splitting** is the mechanism — no
-separate load balancer to build or manage.
-
-- **Staging:** new revision deployed at 0% traffic → health-checked
-  directly via its revision-specific tagged URL → 100% cutover once healthy
-  → post-cutover smoke test. Automatic rollback (traffic back to the prior
-  revision) if either check fails.
-- **Production:** same zero-traffic deploy + direct health check, then a
-  **10% canary** for a 2-minute observation window before promoting to
-  100%. Deploys promote the *exact image SHA* staging already tested —
-  production never runs `docker build`, only `gcloud run deploy` against an
-  image that already exists in Artifact Registry.
-- **Rollback:** `gcloud run services update-traffic <service> --to-revisions=<prior-revision>=100`
-  — automatic on a failed health check/observation window, and a one-line
-  manual command otherwise. The prior revision is never deleted, so
-  rollback is always available.
-
----
-
-## CI/CD
-
-```
-.github/workflows/
-├── ci.yml                 # lint → unit test → integration test (real PG+Redis service containers) → build → Trivy scan
-├── deploy-staging.yml      # on push to main: build+push → deploy 0% → health check → cutover → smoke test
-└── deploy-production.yml   # workflow_dispatch (manual): promote staging's image → canary 10% → observe → 100%
-```
-
-- `ci.yml` is a reusable workflow (`workflow_call`) — both deploy workflows
-  call it as their test gate rather than duplicating lint/test steps.
-- Auth to GCP is via Workload Identity Federation
-  (`google-github-actions/auth`) — no JSON service account key is ever
-  stored as a GitHub secret.
-- Production requires a GitHub Environment approval gate (configure
-  "required reviewers" on the `production` environment in repo settings) —
-  the human decision point the job posting asks for, enforced by GitHub
-  itself rather than anything in the workflow file.
-- Container image is scanned for CRITICAL/HIGH vulnerabilities (Trivy) in
-  `ci.yml` before it's ever pushed.
-
----
-
-## Observability
-
-- **Structured logging:** JSON via `nestjs-pino`, one line per request
-  (`LoggingInterceptor`, runs after guards so `tenantId` is available),
-  carrying a correlation ID reused from an incoming `X-Correlation-Id`
-  header or generated fresh (`CorrelationIdMiddleware`), echoed back on the
-  response.
-- **Metrics:** exposed at `GET /metrics` in Prometheus format
-  (`src/metrics/metrics.service.ts`) rather than written directly to the
-  Cloud Monitoring API from application code:
-  - `flag_evaluation_latency_ms` (histogram, by tenant + endpoint)
-  - `flag_evaluations_total` (counter, by tenant)
-  - `http_requests_total` (counter, by tenant + endpoint + status class)
-  - `flag_config_cache_lookups_total` (counter, by hit/miss)
-
-  **Why not write straight to the Cloud Monitoring API:** it would couple
-  every metrics call site to the GCP SDK and credentials, making local dev
-  and unit tests harder for no real benefit. A `/metrics` endpoint is
-  standard, testable with a plain `curl`, and in the GCP deployment gets
-  scraped by **Google Cloud Managed Service for Prometheus** (one-time
-  `gcloud` setup, no code change) and forwarded into Cloud Monitoring —
-  same destination, looser coupling.
-- **Dashboard + alerts:** provisioned via Terraform
-  (`terraform/modules/monitoring`) — request count by response class,
-  p50/p95/p99 latency, and instance count from Cloud Run's built-in metrics
-  (available immediately, no Prometheus pipeline needed); alert policies for
-  5xx rate, p99 latency > 300ms, and uptime-check failure, all emailing a
-  configured address. The custom Prometheus metrics above appear on the same
-  dashboard once Managed Service for Prometheus is enabled (a dashboard
-  panel links to the one-time setup command).
-- **Honest caveat:** the error-rate alert threshold is on the *absolute
-  rate* of 5xx responses, not a true percentage-of-total ratio. A proper
-  ">5% of requests" alert needs an MQL `ratio_series` query joining two
-  metric series — real, but fiddly enough to get exactly right that I didn't
-  want to ship an untested join without a live project to verify it
-  against. Documented here rather than silently shipped as if it were the
-  percentage version.
-
----
-
-## Testing Strategy & Load Test Results
-
-**What's tested and why:**
-
-| Suite | Covers | Why this, not something else |
-|---|---|---|
-| `test/unit/rollout-hash.spec.ts` | Determinism, uniform distribution (20k users, generous tolerance), monotonicity across rollout %, 0%/100% edges, weighted variant selection | This is the algorithm the entire product's correctness rests on — if it's wrong, nothing else matters |
-| `test/unit/api-key.util.spec.ts` | Key generation entropy/uniqueness, HMAC determinism, pepper sensitivity | The one place a subtle bug silently breaks auth for every tenant |
-| `test/integration/tenant-isolation.spec.ts` | Auth rejection, tenant isolation (URL *and* body-spoofing paths), environment scoping, audit immutability (including a live attempt to `UPDATE` the DB directly) | Multi-tenant correctness is exactly the property that's easy to get right against an in-memory fake and wrong against the real query — this runs against real Postgres/Redis, not mocks |
-| `test/load/evaluate-load-test.js` (k6) | Throughput/latency under concurrency, spread across tenants | See results below |
-| CI (`ci.yml`) | All of the above, on every push/PR, plus a Trivy image scan | Correctness gate before anything reaches staging |
-
-**What I'd add with more time:** unit tests for `FlagsService`'s
-transaction/audit-write paths in isolation (currently only exercised
-indirectly via the integration suite), and a contract test asserting the
-`/metrics` endpoint's exposition format stays scrape-able.
-
-**Load test results** (k6, `test/load/evaluate-load-test.js`, production
-Docker image, 20 tenants round-robined to respect per-tenant rate limits):
-
-| Scenario | Throughput | p50 | p95 | p99 | Errors |
-|---|---|---|---|---|---|
-| 50 concurrent VUs, 90s sustained | ~784 req/s | 31ms | 43ms | 61ms | 0% |
-| 100 concurrent VUs, 4min ramp | ~680 req/s | 56ms | 124ms | 1.33s (tail) | 0% |
-
-At 100 concurrent VUs sustained for minutes, tail latency (p99, and a small
-number of multi-second outliers) degrades — on this shared development
-laptop, that's CPU contention from several other running dev processes
-against a **single** Node.js instance, not a bug in the request path (0%
-errors throughout; every request still completed correctly, just slower).
-This is precisely what Cloud Run's horizontal autoscaling is for: a single
-instance was never meant to be the capacity ceiling — additional instances
-spin up under sustained load and absorb it, which a single-instance local
-benchmark can't demonstrate. The 50-VU numbers reflect the steady-state
-capacity of one instance; production sizing (`cloud_run_max_instances = 20`
-in `environments/production.tfvars`) assumes horizontal scaling handles the
-rest.
-
-Run it yourself:
 ```bash
-k6 run test/load/evaluate-load-test.js                              # against local docker-compose
-k6 run -e BASE_URL=https://<cloud-run-url> test/load/evaluate-load-test.js  # against a deployed environment
+docker build --target runtime -t us-central1-docker.pkg.dev/<project>/feature-flag-service/api:<sha> .
+docker push us-central1-docker.pkg.dev/<project>/feature-flag-service/api:<sha>
 ```
 
----
+Revision traffic splitting gives blue-green and canary releases:
 
-## Assumptions & Trade-offs
+```bash
+# 1. new revision at 0% traffic, reachable on its own tagged URL
+gcloud run deploy flags-<env> --image=<image>:<sha> --region=us-central1 --no-traffic --tag=candidate
+curl https://candidate---<service-url>/health
 
-Documenting these rather than silently picking one, per the assessment's
-own note that parts are intentionally left vague:
+# 2. production: a 10% canary first, then full cutover
+gcloud run services update-traffic flags-<env> --region=us-central1 --to-tags=candidate=10
+gcloud run services update-traffic flags-<env> --region=us-central1 --to-latest
 
-- **Only the staging environment is deployed live for this submission**,
-  not all three. The deliverable asks for one "Deployed application URL,"
-  and the Terraform/CI-CD environment separation is fully built and
-  demonstrated in code (`environments/{dev,staging,production}.tfvars`,
-  separate `deploy-staging.yml`/`deploy-production.yml` workflows) — running
-  three simultaneous live environments (3× Cloud SQL, 3× Redis) would have
-  added cost without adding anything an evaluator could observe that a
-  single live environment doesn't already show.
-- **`/health` instead of the spec's implied `/healthz`.** GET requests to
-  `/healthz` on this project's `*.run.app` domain consistently returned
-  Google's own generic 404 page without ever reaching the container, while
-  every other path (including nonexistent ones, correctly 404ing *from the
-  app*) reached it fine. Root cause unconfirmed — routed around it by
-  renaming rather than debugging an undocumented platform quirk under time
-  pressure. Documented here rather than silently swapped.
-- **`POST /tenants` is unauthenticated.** It mints a tenant's first API key,
-  so *something* has to be the bootstrap step. In production this would sit
-  behind a platform-admin key or an internal-only network path — not built
-  here, since the assessment's tenant model doesn't define an "operator"
-  identity above the tenant level.
-- **`/evaluate` takes a required `flag_key`; `/evaluate/bulk` evaluates
-  every active flag.** The spec lists both endpoints without fully
-  specifying `/evaluate`'s body shape; this split (single named flag vs. "all
-  of them") is the standard client-SDK pattern (single hot-path lookup vs.
-  bootstrap-all-flags-once) and avoids the two endpoints being redundant
-  with each other.
-- **`PUT .../flags/{key}` requires `?environment=` only when touching
-  environment-scoped fields** (`enabled`, `rolloutPercentage`, `variants`,
-  `targetingRules`); `name`/`description`/`defaultValue` apply everywhere and
-  don't need it. One endpoint, two concerns, disambiguated by which fields
-  are present in the body.
-- **Targeting rules are a simple user-ID allow-list** (`{ userIds, value }`),
-  not a full rules engine (attribute-based conditions, AND/OR groups, etc.).
-  Enough to demonstrate the override-priority concept; a real rules DSL
-  would be a substantial project on its own.
-- **NUMBER-type flags don't support percentage rollouts** — there's only one
-  number to serve, so `enabled` alone gates it. Numeric A/B tests should be
-  encoded as STRING variants instead. Documented in
-  [Flag Evaluation Algorithm](#flag-evaluation-algorithm) rather than built
-  as a half-finished numeric-range feature.
-- **SSE real-time distribution is single-instance-only** (in-process
-  `EventEmitter2`, not Redis pub/sub) — correct for this deployment's
-  min-instance counts, called out as a scaling limit in
-  [Future Improvements](#future-improvements) rather than over-built for a
-  bonus feature.
-- **The 5xx alert threshold is absolute rate, not a percentage ratio** — see
-  [Observability](#observability).
+# rollback: the previous revision is never deleted
+gcloud run services update-traffic flags-<env> --region=us-central1 --to-revisions=<previous-revision>=100
+```
 
----
+Promote the exact image digest that ran in staging, rather than rebuilding
+for production. On SIGTERM, `enableShutdownHooks()` lets in-flight requests
+and the Prisma and Redis connections finish while traffic moves away.
 
-## Future Improvements
+## Trade-offs and limits
 
-- **Redis pub/sub for SSE fanout** across multiple Cloud Run instances (see
-  the single-instance limitation above) — needed once `min_instances > 1` or
-  traffic requires horizontal scaling in an environment using the real-time
-  endpoint.
-- **True percentage-ratio error-rate alerting** via Cloud Monitoring MQL
-  `ratio_series`, replacing the current absolute-rate approximation.
-- **Database credential rotation** via Secret Manager + a scheduled Cloud
-  Function, rather than the current one-time-generated `random_password`.
-- **A real targeting rules engine** (attribute conditions, not just a
-  user-ID allow-list) if product requirements grow past "force this value
-  for these specific users."
-- **Multi-region** — everything here is single-region by design (cost/time
-  trade-off for a take-home); Cloud SQL cross-region replicas + a global
-  load balancer in front of regional Cloud Run services would be the next
-  step for global tenants.
-- **Per-tenant configurable rate limits** — currently one global limit per
-  named throttler; a paying tenant with heavier legitimate traffic can't get
-  a higher budget without a code change.
+- **`POST /tenants` is unauthenticated.** It mints a tenant's first key, so
+  something has to be the bootstrap step. In production it belongs behind a
+  platform-admin credential or an internal-only path; the model has no
+  operator identity above tenants yet.
+- **`/health`, not `/healthz`.** On `*.run.app`, requests to `/healthz` were
+  answered by Google's front end with a 404 before reaching the container, so
+  the probe path avoids it.
+- **`/evaluate` takes one `flag_key`; `/evaluate/bulk` returns all active
+  flags.** This mirrors the usual SDK split: hot-path lookup versus
+  bootstrap-everything.
+- **Targeting is a user-id allow-list** (`{ userIds, value }`), not an
+  attribute rules engine. The evaluate DTO already accepts a `context` object,
+  but nothing reads it yet.
+- **NUMBER flags have no rollout.** `enabled` alone gates them; use STRING
+  variants for numeric experiments.
+- **SSE fan-out is in-process** (`EventEmitter2`). A change only reaches
+  clients connected to the instance that handled it. That is fine at one
+  instance; beyond that it needs Redis pub/sub.
+- **The 5xx alert uses an absolute rate.** A true "> 5% of requests" alert
+  needs an MQL ratio query. I didn't want to ship that join untested, without
+  a live project to check it against.
+- **Guard rejections (401/403) are not in the request log or metrics**,
+  because the interceptor runs after guards.
+
+## Future improvements
+
+- Redis pub/sub for SSE across instances.
+- Ratio-based error-rate alerting.
+- Rotation for the database password (currently a one-time `random_password`).
+- A real targeting rules engine using the evaluate `context`.
+- Per-tenant configurable rate limits.
+- Multi-region: Cloud SQL cross-region replicas behind a global load balancer.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
