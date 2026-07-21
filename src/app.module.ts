@@ -61,6 +61,6 @@ import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
 })
 export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) {
-    consumer.apply(CorrelationIdMiddleware).forRoutes('*');
+    consumer.apply(CorrelationIdMiddleware).forRoutes('{*splat}');
   }
 }

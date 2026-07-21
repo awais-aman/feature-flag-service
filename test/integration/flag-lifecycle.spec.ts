@@ -146,14 +146,10 @@ describe('Flag lifecycle (integration)', () => {
       .set('X-API-Key', tenant.apiKey)
       .send({ enabled: true })
       .expect(400);
-
-    // Nest's SSE transport reports pipe failures as an `error` event and
-    // closes the stream, rather than as an HTTP status.
-    const sse = await api()
+    await api()
       .get(`/api/v1/tenants/${tenant.id}/environments/prod/stream`)
-      .set('X-API-Key', tenant.apiKey);
-    expect(sse.text).toContain('event: error');
-    expect(sse.text).toContain('Validation failed');
+      .set('X-API-Key', tenant.apiKey)
+      .expect(400);
   });
 
   it('answers a duplicate flag key with 409, including concurrent creates', async () => {
