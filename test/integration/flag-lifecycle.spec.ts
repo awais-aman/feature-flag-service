@@ -1,3 +1,5 @@
+import { get, IncomingMessage } from 'http';
+import { AddressInfo } from 'net';
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
@@ -167,5 +169,44 @@ describe('Flag lifecycle (integration)', () => {
 
     const statuses = (await Promise.all([create(), create(), create()])).map((r) => r.status).sort();
     expect(statuses).toEqual([201, 409, 409]);
+  });
+
+  it('pushes a change event to SSE subscribers of the affected environment only', async () => {
+    const tenant = await tenantWithFlag('Stream Co', {
+      key: 'live-flag',
+      name: 'Live flag',
+      type: 'BOOLEAN',
+      defaultValue: false,
+    });
+    await app.listen(0);
+    const { port } = app.getHttpServer().address() as AddressInfo;
+
+    const subscribe = (environment: string) =>
+      new Promise<IncomingMessage>((resolve) =>
+        get(
+          {
+            port,
+            path: `/api/v1/tenants/${tenant.id}/environments/${environment}/stream`,
+            headers: { 'X-API-Key': tenant.apiKey },
+          },
+          resolve,
+        ),
+      );
+    const [production, staging] = await Promise.all([subscribe('production'), subscribe('staging')]);
+    const received: Record<string, string> = { production: '', staging: '' };
+    production.on('data', (chunk) => (received.production += chunk));
+    staging.on('data', (chunk) => (received.staging += chunk));
+
+    await api()
+      .put(`/api/v1/tenants/${tenant.id}/flags/live-flag?environment=production`)
+      .set('X-API-Key', tenant.apiKey)
+      .send({ enabled: true, rolloutPercentage: 25 })
+      .expect(200);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    production.destroy();
+    staging.destroy();
+
+    expect(received.production).toContain('data: {"flagKey":"live-flag","environment":"production"}');
+    expect(received.staging).not.toContain('live-flag');
   });
 });
