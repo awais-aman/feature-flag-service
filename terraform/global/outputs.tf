@@ -4,10 +4,10 @@ output "artifact_registry_url" {
 
 output "workload_identity_provider" {
   value       = google_iam_workload_identity_pool_provider.github.name
-  description = "Full resource name — set as the WORKLOAD_IDENTITY_PROVIDER GitHub secret"
+  description = "Full resource name of the OIDC provider the deployer identity trusts"
 }
 
 output "deployer_service_account_email" {
   value       = google_service_account.deployer.email
-  description = "Set as the DEPLOYER_SERVICE_ACCOUNT GitHub secret"
+  description = "Service account that pushes images and rolls out Cloud Run revisions"
 }

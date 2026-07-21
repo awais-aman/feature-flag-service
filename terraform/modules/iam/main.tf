@@ -1,5 +1,4 @@
-# Cloud Run's own runtime identity — separate from the GitHub Actions
-# deployer identity (see terraform/global), which only ever needs to push
+# Cloud Run's own runtime identity — separate from the deployer identity (see terraform/global), which only ever needs to push
 # images and trigger deploys, never to read application secrets.
 resource "google_service_account" "cloud_run_runtime" {
   project      = var.project_id

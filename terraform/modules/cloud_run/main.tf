@@ -1,8 +1,8 @@
 # Terraform provisions the Cloud Run *service* (compute shape, secrets,
 # networking, IAM) — it does not own individual deploys or traffic splits.
-# The CI/CD pipeline (.github/workflows/deploy-*.yml) calls `gcloud run
-# deploy --no-traffic` to publish a new revision and `gcloud run services
-# update-traffic` to shift traffic during a blue-green/canary rollout. If
+# Releases use `gcloud run deploy --no-traffic` to publish a new revision
+# and `gcloud run services update-traffic` to shift traffic during a
+# blue-green/canary rollout (see README "Releasing"). If
 # Terraform also tracked `image`/`traffic` here, every `terraform apply` for
 # an unrelated infra change (e.g. bumping Cloud SQL tier) would silently
 # revert whatever revision/split the last deploy left in place. The

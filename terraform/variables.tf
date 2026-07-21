@@ -19,7 +19,7 @@ variable "environment" {
 }
 
 variable "container_image" {
-  description = "Full Artifact Registry image reference to deploy (e.g. us-central1-docker.pkg.dev/PROJECT/REPO/feature-flag-service:SHA). Left as a distroless placeholder until CI pushes the first real image."
+  description = "Full Artifact Registry image reference to deploy (e.g. us-central1-docker.pkg.dev/PROJECT/REPO/feature-flag-service:SHA). Defaults to Google's hello container until the first real image is pushed."
   type        = string
   default     = "us-docker.pkg.dev/cloudrun/container/hello"
 }
@@ -50,10 +50,5 @@ variable "redis_memory_size_gb" {
 
 variable "alert_notification_email" {
   description = "Email address to receive Cloud Monitoring alert notifications"
-  type        = string
-}
-
-variable "github_repository" {
-  description = "GitHub repo allowed to assume the Workload Identity Federation deployer service account, in 'owner/repo' form"
   type        = string
 }

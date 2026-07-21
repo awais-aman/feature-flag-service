@@ -6,9 +6,8 @@ import { REDIS_CLIENT } from '../redis/redis.constants';
 
 /**
  * Backs both the Docker HEALTHCHECK and the Cloud Run liveness/readiness
- * probes used during blue-green rollout — a new revision only receives
- * traffic once this returns 200, and a failing probe is what triggers an
- * automatic rollback in the deploy workflow.
+ * probes used during blue-green rollout — a new revision should only receive
+ * traffic once this returns 200.
  */
 @Controller()
 export class HealthController {

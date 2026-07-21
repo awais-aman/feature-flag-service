@@ -9,6 +9,5 @@ cloud_run_max_instances = 20
 cloud_sql_tier       = "db-custom-2-4096"
 redis_memory_size_gb = 2
 
-# project_id, alert_notification_email, github_repository, and
-# container_image are passed via -var on the CLI or CI secrets, not
-# committed here — see README "Infrastructure" for the exact commands.
+# project_id, alert_notification_email and container_image are passed via
+# -var on the CLI, not committed here — see README "Infrastructure".

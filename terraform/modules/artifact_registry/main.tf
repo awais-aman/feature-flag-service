@@ -1,7 +1,6 @@
 # One shared repo across dev/staging/production, not one per environment:
-# the whole point of a build-once-promote-everywhere pipeline (see
-# .github/workflows/deploy-*.yml) is that the exact same image digest that
-# passed CI and ran in staging is what gets promoted to production — a
+# the point of build-once-promote-everywhere is that the exact same image
+# digest that was tested and ran in staging is what gets promoted to production — a
 # per-environment repo would invite rebuilding (and therefore re-testing a
 # *different* artifact) at each stage. This is provisioned once from the
 # `terraform/global` stack, not per-environment.
