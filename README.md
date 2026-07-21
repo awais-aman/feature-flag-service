@@ -552,6 +552,18 @@ development laptop:
 | 50 VUs, 90 s sustained | ~784 req/s | 31 ms | 43 ms | 61 ms | 0% |
 | 100 VUs, 4 min ramp | ~680 req/s | 56 ms | 124 ms | 1.33 s | 0% |
 
+A shorter run against the Compose stack (development image in watch mode),
+using the official k6 image on the Compose network:
+
+```bash
+docker run --rm --network feature-flag-service_default -v "$PWD/test/load:/load:ro" \
+  -e BASE_URL=http://api:3000 grafana/k6:0.54.0 run --vus 20 --duration 20s /load/evaluate-load-test.js
+```
+
+| Scenario | Requests | Throughput | p50 | p90 | p95 | Errors |
+|---|---|---|---|---|---|---|
+| 20 VUs, 20 s | 35,024 | ~1,727 req/s | 10.7 ms | 13.6 ms | 16.4 ms | 0% |
+
 At 100 VUs the p99 tail came from CPU contention on one Node process, not
 from errors. Horizontal scaling (`cloud_run_max_instances = 20` in production)
 is what absorbs that. Rate limits are per tenant, which is why the script
