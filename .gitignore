@@ -1,0 +1,35 @@
+# Dependencies and build output
+node_modules/
+project_venv/
+dist/
+build/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Tests, caches, logs
+coverage/
+.cache/
+.eslintcache
+tmp/
+*.log
+npm-debug.log*
+
+# Terraform
+terraform/**/.terraform/
+terraform/**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform/**/override.tf
+terraform/**/override.tf.json
+
+# IDE / OS / tooling
+.vscode/
+.idea/
+.DS_Store
+.claude/
+.github/

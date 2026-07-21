@@ -1,0 +1,143 @@
+// Multi-Tenant Configuration & Feature Flag Service — data model
+//
+// Design note (documented further in README "Data Model" section):
+// A feature flag is defined ONCE per tenant (name/description/type/default value).
+// Its rollout state (enabled, rollout %, targeting) is environment-scoped via
+// FlagEnvironmentConfig, one row per (flag, environment). This mirrors how
+// LaunchDarkly/Unleash actually model flags — the same flag key exists across
+// dev/staging/production, but each environment can be toggled/rolled out
+// independently without duplicating the flag's identity or default value.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum FlagType {
+  BOOLEAN
+  STRING
+  NUMBER
+}
+
+enum AuditAction {
+  TENANT_CREATE
+  FLAG_CREATE
+  FLAG_UPDATE
+  FLAG_ARCHIVE
+  FLAG_RESTORE
+  ENV_CONFIG_UPDATE
+}
+
+model Tenant {
+  id            String   @id @default(uuid())
+  name          String
+  slug          String   @unique
+  // API key auth: keys are high-entropy random tokens (not user-chosen secrets),
+  // so we store an HMAC-SHA256 digest (server-side pepper) rather than bcrypt —
+  // bcrypt's per-request cost is unnecessary here and its non-lookupable salt
+  // would force an O(n) scan-and-compare across tenants on every authenticated
+  // request. HMAC gives O(1) lookup by digest while still being unrecoverable
+  // without the server-side pepper. See README "Security" section.
+  apiKeyHash    String   @unique
+  apiKeyPrefix  String // first 8 chars of the raw key, shown back to the user for identification only
+  createdAt     DateTime @default(now())
+  archivedAt    DateTime?
+
+  environments  Environment[]
+  flags         FeatureFlag[]
+  auditLogs     AuditLog[]
+
+  @@map("tenants")
+}
+
+enum EnvironmentName {
+  development
+  staging
+  production
+}
+
+model Environment {
+  id        String          @id @default(uuid())
+  tenantId  String
+  name      EnvironmentName
+  createdAt DateTime        @default(now())
+
+  tenant       Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  flagConfigs  FlagEnvironmentConfig[]
+  auditLogs    AuditLog[]
+
+  @@unique([tenantId, name])
+  @@map("environments")
+}
+
+model FeatureFlag {
+  id           String    @id @default(uuid())
+  tenantId     String
+  key          String
+  name         String
+  description  String?
+  type         FlagType
+  defaultValue Json
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  archivedAt   DateTime?
+
+  tenant           Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  environmentConfigs FlagEnvironmentConfig[]
+  auditLogs        AuditLog[]
+
+  @@unique([tenantId, key])
+  @@index([tenantId, archivedAt])
+  @@map("feature_flags")
+}
+
+// Per-environment rollout state for a flag. Created (defaulted to disabled,
+// 0% rollout) for every existing environment when a flag is created.
+model FlagEnvironmentConfig {
+  id                String   @id @default(uuid())
+  flagId            String
+  environmentId     String
+  enabled           Boolean  @default(false)
+  rolloutPercentage Int      @default(0) // 0-100
+  // For STRING type flags: ordered list of { value, weight } variants used
+  // instead of a plain on/off rollout. Null for BOOLEAN/NUMBER flags.
+  variants          Json?
+  // Optional simple targeting overrides, e.g. { "userIds": ["u1","u2"] } that
+  // force a value regardless of the percentage bucket. Kept intentionally
+  // simple — see README "Assumptions" for what a fuller rules engine would add.
+  targetingRules     Json?
+  updatedAt         DateTime @updatedAt
+
+  flag        FeatureFlag @relation(fields: [flagId], references: [id], onDelete: Cascade)
+  environment Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+
+  @@unique([flagId, environmentId])
+  @@map("flag_environment_configs")
+}
+
+// Immutable, append-only audit trail. No update/delete paths are exposed at
+// the application layer — enforced by convention (see README) and reinforced
+// by a DB-level BEFORE UPDATE/DELETE trigger applied in a migration (table
+// ownership means a plain REVOKE wouldn't actually stop the app's own role).
+model AuditLog {
+  id            String       @id @default(uuid())
+  tenantId      String
+  flagId        String?
+  environmentId String?
+  action        AuditAction
+  changedBy     String // tenant api key prefix, or "system"
+  previousValue Json?
+  newValue      Json?
+  createdAt     DateTime     @default(now())
+
+  tenant      Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  flag        FeatureFlag? @relation(fields: [flagId], references: [id], onDelete: SetNull)
+  environment Environment? @relation(fields: [environmentId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, flagId, createdAt])
+  @@map("audit_logs")
+}
