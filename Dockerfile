@@ -3,7 +3,7 @@
 ########################
 # deps: install all dependencies (dev + prod) once, reused by build & dev stages
 ########################
-FROM node:20-alpine AS deps
+FROM node:22-alpine AS deps
 WORKDIR /app
 # Prisma's query engine dynamically links libssl; alpine's musl base doesn't
 # ship it by default, so `prisma generate`/migrate silently produce a
@@ -26,7 +26,7 @@ RUN npm run build
 # production-deps: install only production dependencies, separately from the
 # dev-inclusive `deps` stage, so nothing dev-only leaks into the final image
 ########################
-FROM node:20-alpine AS production-deps
+FROM node:22-alpine AS production-deps
 WORKDIR /app
 RUN apk add --no-cache openssl
 COPY package.json package-lock.json* ./
@@ -36,7 +36,7 @@ RUN npm ci --omit=dev && npx prisma generate
 ########################
 # runtime: small, non-root, only what's needed to run the compiled app
 ########################
-FROM node:20-alpine AS runtime
+FROM node:22-alpine AS runtime
 ENV NODE_ENV=production
 WORKDIR /app
 
