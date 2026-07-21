@@ -90,6 +90,7 @@
     "node": ">=22 <23"
   },
   "overrides": {
-    "multer": "^2.5.0"
+    "multer": "^2.5.0",
+    "deepmerge-ts": "^8.0.0"
   }
 }
