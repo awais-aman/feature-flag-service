@@ -1,4 +1,5 @@
 import { CallHandler, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
+import { SSE_METADATA } from '@nestjs/common/constants';
 import { Response } from 'express';
 import { Logger } from 'nestjs-pino';
 import { catchError, tap, throwError } from 'rxjs';
@@ -40,6 +41,13 @@ export class LoggingInterceptor implements NestInterceptor {
         ...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
       });
     };
+
+    // An SSE handler's observable emits once per pushed event, not once per
+    // request, so the stream is logged and counted when it opens instead.
+    if (Reflect.getMetadata(SSE_METADATA, context.getHandler())) {
+      logOutcome(200);
+      return next.handle();
+    }
 
     return next.handle().pipe(
       tap(() => logOutcome(response.statusCode)),

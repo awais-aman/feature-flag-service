@@ -26,6 +26,9 @@ import { LoggingInterceptor } from './common/interceptors/logging.interceptor';
           // (it runs after guards, so it can attach tenantId) — pino here is
           // just the structured JSON writer.
           autoLogging: false,
+          // nestjs-pino attaches the serialized request to every line, and
+          // the raw tenant API key travels in a header.
+          redact: { paths: ['req.headers["x-api-key"]', 'req.headers.authorization'], censor: '[REDACTED]' },
           level: config.get<string>('LOG_LEVEL', 'info'),
           transport:
             config.get<string>('NODE_ENV') !== 'production'
