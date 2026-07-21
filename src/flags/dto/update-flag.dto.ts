@@ -2,6 +2,7 @@ import { Type } from 'class-transformer';
 import {
   IsArray,
   IsBoolean,
+  IsDefined,
   IsInt,
   IsObject,
   IsOptional,
@@ -13,6 +14,11 @@ import {
 } from 'class-validator';
 
 export class VariantDto {
+  // Without a decorator the global ValidationPipe (whitelist +
+  // forbidNonWhitelisted) rejects `value` as an unknown property, which made
+  // variants impossible to set. Its type is checked against the flag type in
+  // FlagsService.
+  @IsDefined()
   value: string | number | boolean;
 
   @IsInt()

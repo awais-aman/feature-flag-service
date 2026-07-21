@@ -1,4 +1,4 @@
-import { Controller, MessageEvent, Param, Sse, UseGuards } from '@nestjs/common';
+import { Controller, MessageEvent, Param, ParseEnumPipe, Sse, UseGuards } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { EnvironmentName } from '@prisma/client';
 import { Observable, fromEvent } from 'rxjs';
@@ -30,7 +30,7 @@ export class RealtimeController {
   @Sse('stream')
   stream(
     @Param('tenantId') tenantId: string,
-    @Param('environment') environment: EnvironmentName,
+    @Param('environment', new ParseEnumPipe(EnvironmentName)) environment: EnvironmentName,
   ): Observable<MessageEvent> {
     return fromEvent(this.events, FLAG_CHANGED_EVENT).pipe(
       filter((event: FlagChangedEvent) => {

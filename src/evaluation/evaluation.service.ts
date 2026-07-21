@@ -89,7 +89,9 @@ export class EvaluationService {
     const { config, cacheHit } = await this.cache.get(tenantId, environment, flagKey);
     this.metrics.recordCacheLookup(cacheHit);
 
-    if (!config) {
+    // Archived flags are excluded from bulk evaluation; the single-flag path
+    // must agree, otherwise an SDK keeps receiving a value for a deleted flag.
+    if (!config || config.archivedAt) {
       throw new NotFoundException(`Flag "${flagKey}" not found for this tenant/environment`);
     }
 

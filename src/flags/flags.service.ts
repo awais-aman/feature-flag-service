@@ -20,6 +20,22 @@ function assertDefaultValueMatchesType(type: FlagType, value: unknown) {
   }
 }
 
+// resolveValue only reads variants for STRING flags, so storing them on any
+// other type would be silently ignored at evaluation time.
+function assertVariantsMatchType(type: FlagType, variants: UpdateFlagDto['variants']) {
+  if (!variants) return;
+  if (type !== FlagType.STRING) {
+    throw new BadRequestException('variants are only supported on STRING flags');
+  }
+  if (variants.some((v) => typeof v.value !== 'string')) {
+    throw new BadRequestException('every variant value must be a string for type STRING');
+  }
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002';
+}
+
 @Injectable()
 export class FlagsService {
   constructor(
@@ -36,50 +52,52 @@ export class FlagsService {
       throw new NotFoundException('Tenant has no environments provisioned');
     }
 
-    const existing = await this.prisma.featureFlag.findUnique({
-      where: { tenantId_key: { tenantId, key: dto.key } },
-    });
-    if (existing) {
-      throw new ConflictException(`Flag with key "${dto.key}" already exists for this tenant`);
-    }
-
-    const flag = await this.prisma.$transaction(async (tx) => {
-      const created = await tx.featureFlag.create({
-        data: {
-          tenantId,
-          key: dto.key,
-          name: dto.name,
-          description: dto.description,
-          type: dto.type,
-          defaultValue: dto.defaultValue as Prisma.InputJsonValue,
-          environmentConfigs: {
-            // Every flag starts disabled/0% in every environment — an
-            // explicit opt-in step is always required before a flag can
-            // affect real users, in any environment including production.
-            create: environments.map((env) => ({ environmentId: env.id })),
-          },
-        },
-        include: { environmentConfigs: true },
-      });
-
-      await this.audit.record(
-        {
-          tenantId,
-          flagId: created.id,
-          action: AuditAction.FLAG_CREATE,
-          changedBy,
-          newValue: {
-            key: created.key,
-            name: created.name,
-            type: created.type,
+    const flag = await this.prisma
+      .$transaction(async (tx) => {
+        const created = await tx.featureFlag.create({
+          data: {
+            tenantId,
+            key: dto.key,
+            name: dto.name,
+            description: dto.description,
+            type: dto.type,
             defaultValue: dto.defaultValue as Prisma.InputJsonValue,
+            environmentConfigs: {
+              // Every flag starts disabled/0% in every environment — an
+              // explicit opt-in step is always required before a flag can
+              // affect real users, in any environment including production.
+              create: environments.map((env) => ({ environmentId: env.id })),
+            },
           },
-        },
-        tx,
-      );
+          include: { environmentConfigs: true },
+        });
 
-      return created;
-    });
+        await this.audit.record(
+          {
+            tenantId,
+            flagId: created.id,
+            action: AuditAction.FLAG_CREATE,
+            changedBy,
+            newValue: {
+              key: created.key,
+              name: created.name,
+              type: created.type,
+              defaultValue: dto.defaultValue as Prisma.InputJsonValue,
+            },
+          },
+          tx,
+        );
+
+        return created;
+      })
+      .catch((error: unknown) => {
+        // The (tenantId, key) unique index is the source of truth; a
+        // read-then-insert check would still let concurrent creates race.
+        if (isUniqueViolation(error)) {
+          throw new ConflictException(`Flag with key "${dto.key}" already exists for this tenant`);
+        }
+        throw error;
+      });
 
     // Emitted after commit, not from inside the transaction, so a listener
     // (cache invalidation, SSE) never reacts to a change that later rolled back.
@@ -139,24 +157,27 @@ export class FlagsService {
       dto.variants !== undefined ||
       dto.targetingRules !== undefined;
 
+    assertVariantsMatchType(flag.type, dto.variants);
+
     if (hasEnvFields && !environment) {
       throw new BadRequestException(
         '?environment= query param is required when updating enabled, rolloutPercentage, variants, or targetingRules',
       );
     }
 
+    const flagLevelChanges: Prisma.FeatureFlagUpdateInput = {};
+    if (dto.name !== undefined) flagLevelChanges.name = dto.name;
+    if (dto.description !== undefined) flagLevelChanges.description = dto.description;
+    if (dto.defaultValue !== undefined) {
+      assertDefaultValueMatchesType(flag.type, dto.defaultValue);
+      flagLevelChanges.defaultValue = dto.defaultValue as Prisma.InputJsonValue;
+    }
+    const hasFlagLevelChanges = Object.keys(flagLevelChanges).length > 0;
+
     const result = await this.prisma.$transaction(async (tx) => {
       let updatedFlag = flag;
 
-      const flagLevelChanges: Prisma.FeatureFlagUpdateInput = {};
-      if (dto.name !== undefined) flagLevelChanges.name = dto.name;
-      if (dto.description !== undefined) flagLevelChanges.description = dto.description;
-      if (dto.defaultValue !== undefined) {
-        assertDefaultValueMatchesType(flag.type, dto.defaultValue);
-        flagLevelChanges.defaultValue = dto.defaultValue as Prisma.InputJsonValue;
-      }
-
-      if (Object.keys(flagLevelChanges).length > 0) {
+      if (hasFlagLevelChanges) {
         const previousValue = {
           name: flag.name,
           description: flag.description,
@@ -223,7 +244,10 @@ export class FlagsService {
       return this.findOwnedFlagOrThrow(tenantId, flagKey, tx);
     });
 
-    this.events.emit(FLAG_CHANGED_EVENT, new FlagChangedEvent(tenantId, flagKey, environment));
+    // A name/description/defaultValue change affects every environment, so
+    // the event must not be narrowed to the ?environment= passed alongside it.
+    const scope = hasFlagLevelChanges ? undefined : environment;
+    this.events.emit(FLAG_CHANGED_EVENT, new FlagChangedEvent(tenantId, flagKey, scope));
     return result;
   }
 

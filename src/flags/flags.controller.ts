@@ -6,6 +6,7 @@ import {
   HttpCode,
   HttpStatus,
   Param,
+  ParseEnumPipe,
   Post,
   Put,
   Query,
@@ -46,7 +47,8 @@ export class FlagsController {
   update(
     @Param('tenantId') tenantId: string,
     @Param('flagKey') flagKey: string,
-    @Query('environment') environment: EnvironmentName | undefined,
+    @Query('environment', new ParseEnumPipe(EnvironmentName, { optional: true }))
+    environment: EnvironmentName | undefined,
     @Body() dto: UpdateFlagDto,
     @CurrentTenant() tenant: Tenant,
   ) {
